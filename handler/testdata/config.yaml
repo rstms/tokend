@@ -1,3 +1,0 @@
-tokend:
-  verbose: true
-  cache_dir: testdata/cache

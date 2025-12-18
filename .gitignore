@@ -5,3 +5,4 @@ cruft
 *.core
 *.log
 *postactivate
+handler/testdata
