@@ -1,13 +1,16 @@
 package handler
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,20 +20,63 @@ import (
 const Version = "0.0.1"
 
 const SHUTDOWN_TIMEOUT = 5 * time.Second
+const DEFAULT_SCOPE = "https://mail.google.com/"
 
 type Handler struct {
-	verbose  bool
-	Flows    map[string]*Flow
-	shutdown chan struct{}
-	server   http.Server
+	verbose   bool
+	Flows     map[string]*Flow
+	shutdown  chan struct{}
+	server    http.Server
+	client    APIClient
+	Domain    string
+	Usernames []string
 }
 
 func NewHandler() (*Handler, error) {
-	h := Handler{
-		verbose:  ViperGetBool("verbose"),
-		Flows:    make(map[string]*Flow),
-		shutdown: make(chan struct{}, 1),
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		return nil, Fatal(err)
 	}
+	_, domain, ok := strings.Cut(hostname, ".")
+	if ok {
+		ViperSetDefault("domain", domain)
+	}
+
+	err = setDefaultUsernames()
+	if err != nil {
+		return nil, Fatal(err)
+	}
+
+	apiClient, err := NewAPIClient("", "", "", "", "", nil)
+	if err != nil {
+		return nil, Fatal(err)
+	}
+
+	domain = ViperGetString("domain")
+	usernames := []string{}
+
+	for _, name := range ViperGetStringSlice("usernames") {
+		usernames = append(usernames, name+"@"+domain)
+	}
+
+	ViperSetDefault("scope", DEFAULT_SCOPE)
+	ViperSetDefault("frontend_uri", fmt.Sprintf("https://webmail.%s/oauth/", domain))
+
+	h := Handler{
+		verbose:   ViperGetBool("verbose"),
+		Flows:     make(map[string]*Flow),
+		shutdown:  make(chan struct{}, 1),
+		Domain:    domain,
+		Usernames: usernames,
+		client:    apiClient,
+	}
+
+	err = h.ReadFlowState()
+	if err != nil {
+		return nil, Fatal(err)
+	}
+
 	return &h, nil
 }
 
@@ -45,6 +91,27 @@ type AuthenticateRequest struct {
 	Username string
 	Gmail    string
 	JWT      string
+}
+
+func (h *Handler) ReadFlowState() error {
+	flows, err := ReadFlowMap()
+	if err != nil {
+		return Fatal(err)
+	}
+	h.Flows = flows
+	log.Printf("ReadFlowState: flow count=%d\n", len(h.Flows))
+	return nil
+}
+
+func (h *Handler) WriteFlowState() error {
+	if h.verbose {
+		log.Printf("WriteFlowState: flow count=%d\n", len(h.Flows))
+	}
+	err := WriteFlowMap(h.Flows)
+	if err != nil {
+		return Fatal(err)
+	}
+	return nil
 }
 
 func (h *Handler) fail(w http.ResponseWriter, user, request, message string, status int) {
@@ -71,85 +138,183 @@ func (h *Handler) succeed(w http.ResponseWriter, message string, result interfac
 func (h *Handler) handleAuthenticateRequest(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
+	// FIXME: authenticate request
+
 	// TODO: check that X-Real-IP is listed in /etc/iplsd/ip
 	/*
-		sourceIp := r.Header["X-Real-Ip"]
-		if len(sourceIp) != 1 || sourceIp[0] != "127.0.0.1" {
-			h.fail(w, "system", "rescand", "unauthorized", http.StatusUnauthorized)
-			return
+			sourceIp := r.Header["X-Real-Ip"]
+			if len(sourceIp) != 1 || sourceIp[0] != "127.0.0.1" {
+				h.fail(w, "system", "rescand", "unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+		var origin string
+		if len(r.Header["Origin"]) > 0 {
+			origin = r.Header["Origin"][0]
 		}
+		log.Printf("origin: %s\n", origin)
+		expectedOrigin := "https://webmail." + domain
+		if origin != expectedOrigin {
+			log.Printf("unauthorized origin: expected %s, got %s\n", expectedOrigin, origin)
+			h.fail(w, "system", "gmail_auth", "unauthorized", http.StatusUnauthorized)
+		}
+
+		log.Printf("RemoteAddr: %s\n", r.RemoteAddr)
+		sourceIp, _, ok := strings.Cut(r.RemoteAddr, ":")
+		if !ok || sourceIp != "127.0.0.1" {
+			h.fail(w, "system", "gmail_auth", "unauthorized", http.StatusUnauthorized)
+		}
+
 	*/
-
-	_, domain, ok := strings.Cut(ViperGetString("mail_domain"), ".")
-	if !ok {
-		log.Printf("domain config failed: %s\n", domain)
-		h.fail(w, "system", "gmail_auth", "configuration failure", 500)
-	}
-
-	var origin string
-	if len(r.Header["Origin"]) > 0 {
-		origin = r.Header["Origin"][0]
-	}
-	log.Printf("origin: %s\n", origin)
-	expectedOrigin := "https://webmail." + domain
-	if origin != expectedOrigin {
-		log.Printf("unauthorized origin: expected %s, got %s\n", expectedOrigin, origin)
-		h.fail(w, "system", "gmail_auth", "unauthorized", http.StatusUnauthorized)
-	}
-
-	log.Printf("RemoteAddr: %s\n", r.RemoteAddr)
-	sourceIp, _, ok := strings.Cut(r.RemoteAddr, ":")
-	if !ok || sourceIp != "127.0.0.1" {
-		h.fail(w, "system", "gmail_auth", "unauthorized", http.StatusUnauthorized)
-	}
 
 	var request AuthenticateRequest
 	err := json.NewDecoder(r.Body).Decode(&request)
 	if err != nil {
-		h.fail(w, "system", "gmail_auth", fmt.Sprintf("failed decoding request: %v", err), http.StatusBadRequest)
+		h.fail(w, "TOKEN_DAEMON", "authenticate_request", fmt.Sprintf("failed decoding request: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	localAddress := fmt.Sprintf("%s@%s", request.Username, domain)
-	requestString := fmt.Sprintf("authorize %s as %s", localAddress, request.Gmail)
-
-	if !strings.HasPrefix(localAddress, "gmail.") {
-		h.fail(w, localAddress, requestString, "local username requires 'gmail.' prefix", http.StatusBadRequest)
-		return
-	}
 	if request.Username == "" {
-		h.fail(w, localAddress, requestString, "missing username", http.StatusBadRequest)
+		h.fail(w, "TOKEN_DAEMON", "authenticate_request", "missing username", http.StatusBadRequest)
 		return
 	}
-	if request.Gmail == "" {
-		h.fail(w, localAddress, requestString, "missing gmail address", http.StatusBadRequest)
+
+	requestString := fmt.Sprintf("authenticate %s", request.Username)
+
+	if !strings.HasPrefix(request.Username, "gmail.") {
+		h.fail(w, "TOKEN_DAEMON", requestString, "username requires 'gmail.' prefix", http.StatusBadRequest)
+		return
 	}
 
-	log.Printf("localAddress: %s\n", localAddress)
-	log.Printf("gmailAddress: %s\n", request.Gmail)
-	log.Printf("JWT=%s\n", request.JWT)
+	if !strings.HasSuffix(request.Username, "@"+h.Domain) {
+		h.fail(w, "TOKEN_DAEMON", requestString, fmt.Sprintf("domain must be %s", h.Domain), http.StatusBadRequest)
+		return
+	}
 
-	// determine if user is valid
-	/*
-		var dumpResponse UserDumpResponse
-		_, err = filterctl.Get(fmt.Sprintf("/filterctl/dump/%s/", localAddress), &dumpResponse)
+	if !slices.Contains(h.Usernames, request.Username) {
+		h.fail(w, request.Username, requestString, fmt.Sprintf("unknown username: %s", request.Username), http.StatusNotFound)
+		return
+	}
+
+	flow, err := h.NewFlow()
+	if err != nil {
+		log.Printf("%v\n", Fatal(err))
+		h.fail(w, "TOKEN_DAEMON", "authenticate_request", "server failure", http.StatusInternalServerError)
+		return
+	}
+	flow.Local = request.Username
+
+	params := map[string]string{}
+	params["scope"] = ViperGetString("scope")
+	params["access_type"] = "offline"
+	params["include_granted_scopes"] = "true"
+	params["response_type"] = "code"
+	params["state"] = flow.Nonce.Text
+	params["redirect_uri"] = ViperGetString("authenticated_redirect_uri")
+	params["client_id"] = ViperGetString("client_id")
+	params["prompt"] = "select_account consent"
+
+	authURI, err := h.buildURI(ViperGetString("auth_uri"), params)
+	if err != nil {
+		log.Printf("%v\n", Fatal(err))
+		h.fail(w, "TOKEN_DAEMON", "authenticate_request", "server failure", http.StatusInternalServerError)
+		return
+	}
+
+	// respond with the OAUTH2 auth URI
+	var response Response
+	response.Success = true
+	response.User = request.Username
+	response.Request = requestString
+	response.Message = authURI.String()
+	h.succeed(w, response.Message, &response)
+}
+
+func (h *Handler) handleDeauthenticateRequest(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+
+	// FIXME: authenticate request
+
+	requestString := "deauthenticate_request"
+	var request AuthenticateRequest
+	err := json.NewDecoder(r.Body).Decode(&request)
+	if err != nil {
+		h.fail(w, "TOKEN_DAEMON", requestString, fmt.Sprintf("failed decoding request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if request.Username == "" {
+		h.fail(w, "TOKEN_DAEMON", requestString, "missing username", http.StatusBadRequest)
+		return
+	}
+
+	requestString = fmt.Sprintf("deauthenticate %s", request.Username)
+
+	if !strings.HasPrefix(request.Username, "gmail.") {
+		h.fail(w, "TOKEN_DAEMON", requestString, "username requires 'gmail.' prefix", http.StatusBadRequest)
+		return
+	}
+
+	if !strings.HasSuffix(request.Username, "@"+h.Domain) {
+		h.fail(w, "TOKEN_DAEMON", requestString, fmt.Sprintf("domain must be %s", h.Domain), http.StatusBadRequest)
+		return
+	}
+
+	if !slices.Contains(h.Usernames, request.Username) {
+		h.fail(w, request.Username, requestString, fmt.Sprintf("unknown username: %s", request.Username), http.StatusNotFound)
+		return
+	}
+
+	var deauthState string
+	var deauthFlow *Flow
+	for state, flow := range h.Flows {
+		if flow.Local == request.Username {
+			deauthState = state
+			deauthFlow = flow
+			break
+		}
+	}
+
+	if deauthState == "" {
+		h.fail(w, "TOKEN_DAEMON", requestString, fmt.Sprintf("no authorization found for: %s", request.Username), http.StatusNotFound)
+	}
+
+	delete(h.Flows, deauthState)
+	states, err := ListFlowStates()
+	if err != nil {
+		log.Printf("ListFlowStates failed with:%v\n", Fatal(err))
+		h.fail(w, "TOKEN_DAEMON", requestString, "server failure", http.StatusInternalServerError)
+		return
+	}
+
+	if slices.Contains(states, deauthState) {
+		err := DeleteFlow(deauthFlow)
 		if err != nil {
-			h.fail(w, localAddress, requestString, "local account validation failed", 500)
+			log.Printf("DeleteFlow failed with: %v\n", Fatal(err))
+			h.fail(w, "TOKEN_DAEMON", requestString, "server failure", http.StatusInternalServerError)
 			return
 		}
-		if dumpResponse.User != localAddress || len(dumpResponse.Password) == 0 {
-			h.fail(w, localAddress, requestString, fmt.Sprintf("%s is not a valid address", localAddress), 404)
-			return
-		}
-	*/
-
-	//TODO: upload the JWT to the mailqueue to configure fetchmail
+	}
 
 	var response Response
 	response.Success = true
+	response.User = request.Username
 	response.Request = requestString
-	response.Message = fmt.Sprintf("received gmail credential: %s == %s", localAddress, request.Gmail)
+	response.Message = fmt.Sprintf("OAUTH2 gmail tokens deleted for %s;  IMPORTANT: You must also remove the 3rd-party authorizations on your Google account.", request.Username)
 	h.succeed(w, response.Message, &response)
+}
+
+func (h *Handler) buildURI(base string, params map[string]string) (*url.URL, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return nil, Fatal(err)
+	}
+	q := u.Query()
+	for key, value := range params {
+		q.Set(key, value)
+	}
+	u.RawQuery = q.Encode()
+	return u, nil
 }
 
 func logRequest(label string, request map[string]any) {
@@ -157,44 +322,153 @@ func logRequest(label string, request map[string]any) {
 	for k, v := range request {
 		log.Printf("%s: %+v\n", k, v)
 	}
-	log.Println("END %s\n", label)
+	log.Printf("END %s\n", label)
+}
+
+func parseQueryParams(uri *url.URL) map[string]string {
+	params := map[string]string{}
+	for key, value := range uri.Query() {
+		switch len(value) {
+		case 1:
+			params[key] = value[0]
+		default:
+			params[key] = strings.Join(value, ",")
+		}
+	}
+	return params
+}
+
+func (h *Handler) handleAuthenticatedCallback(w http.ResponseWriter, r *http.Request) {
+	// FIXME: authenticate request
+	log.Printf("%s /oauth/authenticated/\n", r.Method)
+	requestString := "authenticated_callback"
+	defer r.Body.Close()
+	var authParams map[string]string
+	switch r.Method {
+	case "POST":
+		var request map[string]any
+		err := json.NewDecoder(r.Body).Decode(&request)
+		if err != nil {
+			h.fail(w, "TOKEN_DAEMON", requestString, fmt.Sprintf("failed decoding request: %v", err), http.StatusBadRequest)
+		}
+		return
+		logRequest(requestString, request)
+	case "GET":
+		authParams = parseQueryParams(r.URL)
+		log.Printf("queryParams: %s\n", FormatJSON(authParams))
+	}
+
+	state := authParams["state"]
+	flow, ok := h.Flows[state]
+	if !ok {
+		fmt.Printf("unknown OAUTH flow: state=%s\n", state)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	flow.Code = authParams["code"]
+	relayParams := map[string]string{}
+	relayParams["state"] = authParams["state"]
+	relayParams["authentication"] = "success"
+	relayParams["authorization"] = "pending"
+	redirectURI, err := h.buildURI(ViperGetString("frontend_uri"), relayParams)
+	if err != nil {
+		log.Printf("%v\n", Fatal(err))
+		h.fail(w, "TOKEN_DAEMON", requestString, fmt.Sprintf("failed decoding request: %v", err), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, redirectURI.String(), http.StatusFound)
 }
 
 func (h *Handler) handleAuthorizeRequest(w http.ResponseWriter, r *http.Request) {
-	log.Printf("authenticate callback: %+v\n", *r)
+	// FIXME: authenticate request
+	requestString := "authorize_request"
 	defer r.Body.Close()
 	var request map[string]any
 	err := json.NewDecoder(r.Body).Decode(&request)
 	if err != nil {
-		h.fail(w, "oauth2", "authenticate_callback", fmt.Sprintf("failed decoding request: %v", err), http.StatusBadRequest)
+		h.fail(w, "TOKEN_DAEMON", requestString, fmt.Sprintf("failed decoding request: %v", err), http.StatusBadRequest)
 		return
 	}
+	logRequest(requestString, request)
+
+	state := request["state"].(string)
+	flow, ok := h.Flows[state]
+	if !ok {
+		fmt.Printf("%s: unknown OAUTH flow: state=%s\n", requestString, state)
+		h.fail(w, "TOKEN_DAEMON", requestString, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	/*
+		form := url.Values{}
+		form.Add("client_id", ViperGetString("client_id"))
+		form.Add("client_secret", ViperGetString("client_secret"))
+		form.Add("code", flow.Code)
+		form.Add("grant_type", "authorization_code")
+		form.Add("redirect_uri", ViperGetString("authorized_redirect_uri"))
+		requestData := []byte(form.Encode())
+	*/
+	requestData := map[string]string{
+		"client_id":     ViperGetString("client_id"),
+		"client_secret": ViperGetString("client_secret"),
+		"code":          flow.Code,
+		"grant_type":    "authorization_code",
+		"redirect_uri":  ViperGetString("authenticated_redirect_uri"),
+	}
+
+	header := map[string]string{
+		"Content-Type":                     "application/json",
+		"Access-Control-Allow-Origin":      "https://webmail.mailcapsule.io",
+		"Access-Control-Allow-Methods":     "GET, POST, OPTIONS",
+		"Access-Control-Allow-Credentials": "true",
+	}
+
+	var accessData map[string]any
+	_, err = h.client.Post(ViperGetString("token_uri"), &requestData, &accessData, &header)
+	if err != nil {
+		log.Printf("%s failed posting access request: %v", requestString, Fatal(err))
+		h.fail(w, "TOKEN_DAEMON", requestString, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("accessData: %s\n", FormatJSON(accessData))
+
+	token, err := NewToken(accessData)
+	if err != nil {
+		log.Printf("%s failed parsing access token data: %v", requestString, Fatal(err))
+		h.fail(w, "TOKEN_DAEMON", requestString, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	flow.Token = token
+	flow.Gmail = token.JWT["email"]
+
+	var response Response
+	response.Success = true
+	response.User = flow.Local
+	response.Request = requestString
+	response.Message = fmt.Sprintf("incoming mail to %s will be fetched to %s, sent mail will route via gmail", flow.Gmail, flow.Local)
+	h.succeed(w, response.Message, &response)
 }
 
-func (h *Handler) handleAuthenticateCallback(w http.ResponseWriter, r *http.Request) {
-	log.Printf("authenticate callback: %+v\n", *r)
-	defer r.Body.Close()
-	var request map[string]any
-	err := json.NewDecoder(r.Body).Decode(&request)
-	if err != nil {
-		h.fail(w, "oauth2", "authenticate_callback", fmt.Sprintf("failed decoding request: %v", err), http.StatusBadRequest)
-		return
+func (h *Handler) handleAuthorizedCallback(w http.ResponseWriter, r *http.Request) {
+	// FIXME: authenticate request
+	log.Printf("%s /oauth/authorized/\n", r.Method)
+	requestString := "authorized_callback"
+	var accessParams map[string]string
+	switch r.Method {
+	case "POST":
+		defer r.Body.Close()
+		var request map[string]any
+		err := json.NewDecoder(r.Body).Decode(&request)
+		if err != nil {
+			h.fail(w, "TOKEN_DAEMON", requestString, fmt.Sprintf("failed decoding request: %v", err), http.StatusBadRequest)
+			return
+		}
+	case "GET":
+		accessParams = parseQueryParams(r.URL)
+		log.Printf("accessParams: %s\n", FormatJSON(accessParams))
 	}
-	logRequest("authenticateCallback", request)
-	w.WriteHeader(200)
-}
-
-func (h *Handler) handleAuthorizeCallback(w http.ResponseWriter, r *http.Request) {
-	log.Printf("authorize callback: %+v\n", *r)
-	defer r.Body.Close()
-	var request map[string]any
-	err := json.NewDecoder(r.Body).Decode(&request)
-	if err != nil {
-		h.fail(w, "oauth2", "authorize_callback", fmt.Sprintf("failed decoding request: %v", err), http.StatusBadRequest)
-		return
-	}
-	logRequest("authorize callback", request)
-	w.WriteHeader(200)
 }
 
 func (h *Handler) NewFlow() (*Flow, error) {
@@ -207,24 +481,30 @@ func (h *Handler) NewFlow() (*Flow, error) {
 }
 
 func (h *Handler) handleNonceRequest(w http.ResponseWriter, r *http.Request) {
+	//FIXME: authenticate request
 	log.Printf("get nonce: %+v\n", *r)
 	defer r.Body.Close()
 	flow, err := h.NewFlow()
 	if err != nil {
-		fmt.Printf("%v\n", Fatal(err))
-		h.fail(w, "tokend", "get nonce", "internal failure", http.StatusInternalServerError)
+		log.Printf("%v\n", Fatal(err))
+		h.fail(w, "TOKEN_DAEMON", "get nonce", "internal failure", http.StatusInternalServerError)
 		return
 	}
 	_, err = w.Write([]byte(flow.Nonce.Text))
 	if err != nil {
-		fmt.Printf("%v\n", Fatal(err))
-		h.fail(w, "tokend", "write nonce", "internal failure", http.StatusInternalServerError)
+		log.Printf("%v\n", Fatal(err))
+		h.fail(w, "TOKEN_DAEMON", "write nonce", "internal failure", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(200)
 	if h.verbose {
-		fmt.Printf("New Flow: %s\n", FormatJSON(flow))
+		log.Printf("New Flow: %s\n", FormatJSON(flow))
 	}
+}
+
+func (h *Handler) handleUsernamesRequest(w http.ResponseWriter, r *http.Request) {
+	//FIXME: authenticate request
+	h.succeed(w, "usernames", &h.Usernames)
 }
 
 func (h *Handler) Run() error {
@@ -250,18 +530,20 @@ func (h *Handler) Start() error {
 		IdleTimeout: 5 * time.Second,
 	}
 
-	http.HandleFunc("POST /authenticate", h.handleAuthenticateRequest)
-	http.HandleFunc("GET /authenticated", h.handleAuthenticateCallback)
-	http.HandleFunc("POST /authorize", h.handleAuthorizeRequest)
-	http.HandleFunc("GET /authorized", h.handleAuthorizeCallback)
-	http.HandleFunc("GET /nonce", h.handleNonceRequest)
+	http.HandleFunc("POST /oauth/authenticate/", h.handleAuthenticateRequest)
+	http.HandleFunc("POST /oauth/deauthenticate/", h.handleDeauthenticateRequest)
+	http.HandleFunc("/oauth/authenticated/", h.handleAuthenticatedCallback)
+	http.HandleFunc("POST /oauth/authorize/", h.handleAuthorizeRequest)
+	http.HandleFunc("/oauth/authorized/", h.handleAuthorizedCallback)
+	http.HandleFunc("GET /oauth/nonce/", h.handleNonceRequest)
+	http.HandleFunc("GET /oauth/usernames/", h.handleUsernamesRequest)
 
 	go func() {
 		log.Printf("listening for HTTP requests on %s\n", h.server.Addr)
 		defer log.Println("exiting HTTP request handler")
 		err := h.server.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {
-			log.Printf("%s\n", Fatalf("ListenAndServe failed: ", err))
+			log.Printf("%s\n", Fatalf("ListenAndServe failed: %v", err))
 		}
 	}()
 
@@ -315,6 +597,12 @@ func (h *Handler) Wait() error {
 	if err != nil {
 		return Fatal(err)
 	}
+
+	err = h.WriteFlowState()
+	if err != nil {
+		return Fatal(err)
+	}
+
 	if h.verbose {
 		log.Println("Wait: shutdown complete")
 	}
@@ -333,5 +621,30 @@ func (h *Handler) Stop() error {
 	if h.verbose {
 		log.Println("Stop: stopped")
 	}
+	return nil
+}
+
+func setDefaultUsernames() error {
+	ifp, err := os.Open("/etc/passwd")
+	if err != nil {
+		return Fatal(err)
+	}
+	defer ifp.Close()
+	usernames := []string{}
+	scanner := bufio.NewScanner(ifp)
+	for scanner.Scan() {
+		text := scanner.Text()
+		if strings.HasPrefix(text, "gmail.") {
+			user, _, ok := strings.Cut(text, ":")
+			if ok {
+				usernames = append(usernames, user)
+			}
+		}
+	}
+	err = scanner.Err()
+	if err != nil {
+		return Fatal(err)
+	}
+	ViperSetDefault("usernames", usernames)
 	return nil
 }

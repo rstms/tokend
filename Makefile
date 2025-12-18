@@ -69,3 +69,6 @@ sterile: clean
 
 show-vars:
 	@$(foreach var,$(all_variables),echo $(var)=$($(var));)
+
+run:
+	./tokend run 

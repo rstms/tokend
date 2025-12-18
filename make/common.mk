@@ -1,6 +1,5 @@
 # go makefile common include
 
-
 #
 # detect os
 #
