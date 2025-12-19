@@ -6,28 +6,34 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
+const FLOW_LIFETIME = 300 * time.Second
+
 type Flow struct {
-	Local        string
-	Gmail        string
-	JWT          string
-	AuthToken    string
-	RefreshToken string
-	Nonce        *Nonce
+	Id           string
+	LocalAddress string
 	Code         string
-	Token        *Token
+	Created      time.Time
 }
 
-func NewFlow() (*Flow, error) {
-	nonce, err := NewNonce()
+func NewFlow(localAddress string) (*Flow, error) {
+	fid, err := NewId()
 	if err != nil {
 		return nil, Fatal(err)
 	}
 	flow := Flow{
-		Nonce: nonce,
+		Id:           fid,
+		LocalAddress: localAddress,
+		Created:      time.Now(),
 	}
+	log.Printf("created flow: %s\n", FormatJSON(flow))
 	return &flow, nil
+}
+
+func (f *Flow) IsExpired() bool {
+	return time.Now().After(f.Created.Add(FLOW_LIFETIME))
 }
 
 func flowCacheDir() (string, error) {
@@ -36,7 +42,7 @@ func flowCacheDir() (string, error) {
 		return "", Fatal(err)
 	}
 	ViperSetDefault("cache_dir", filepath.Join(dir, "tokend"))
-	cacheDir := ViperGetString("cache_dir")
+	cacheDir := filepath.Join(ViperGetString("cache_dir"), "flows")
 	if !IsDir(cacheDir) {
 		err := os.MkdirAll(cacheDir, 0700)
 		if err != nil {
@@ -55,11 +61,12 @@ func flowFilename(flow *Flow) (string, error) {
 	if err != nil {
 		return "", Fatal(err)
 	}
-	flowFile := filepath.Join(flowDir, flow.Nonce.Text) + ".json"
+	flowFile := filepath.Join(flowDir, flow.Id) + ".json"
 	return flowFile, nil
 }
 
 func DeleteFlow(flow *Flow) error {
+	log.Printf("deleting flow: %s\n", flow.Id)
 	flowFile, err := flowFilename(flow)
 	if err != nil {
 		return Fatal(err)
@@ -78,6 +85,7 @@ func DeleteFlow(flow *Flow) error {
 }
 
 func WriteFlow(flow *Flow) error {
+	log.Printf("writing flow: %s\n", flow.Id)
 	flowFile, err := flowFilename(flow)
 	if err != nil {
 		return Fatal(err)
@@ -95,9 +103,9 @@ func WriteFlow(flow *Flow) error {
 	return nil
 }
 
-func ReadFlow(state string) (*Flow, error) {
+func ReadFlow(id string) (*Flow, error) {
 	flowDir, err := flowCacheDir()
-	flowFile := filepath.Join(flowDir, state+".json")
+	flowFile := filepath.Join(flowDir, id+".json")
 	data, err := os.ReadFile(flowFile)
 	if err != nil {
 		return nil, Fatal(err)
@@ -107,6 +115,7 @@ func ReadFlow(state string) (*Flow, error) {
 	if err != nil {
 		return nil, Fatal(err)
 	}
+	log.Printf("read flow: %s\n", flow.Id)
 	return &flow, nil
 }
 
@@ -120,7 +129,7 @@ func WriteFlowMap(flows map[string]*Flow) error {
 	return nil
 }
 
-func ListFlowStates() ([]string, error) {
+func ListFlowIds() ([]string, error) {
 	flowDir, err := flowCacheDir()
 	if err != nil {
 		return nil, Fatal(err)
@@ -141,17 +150,17 @@ func ListFlowStates() ([]string, error) {
 }
 
 func ReadFlowMap() (map[string]*Flow, error) {
-	states, err := ListFlowStates()
+	ids, err := ListFlowIds()
 	if err != nil {
 		return nil, Fatal(err)
 	}
 	flows := make(map[string]*Flow)
-	for _, state := range states {
-		flow, err := ReadFlow(state)
+	for _, id := range ids {
+		flow, err := ReadFlow(id)
 		if err != nil {
 			return nil, Fatal(err)
 		}
-		flows[state] = flow
+		flows[id] = flow
 	}
 	return flows, nil
 }

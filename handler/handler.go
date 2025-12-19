@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,6 +25,7 @@ const DEFAULT_SCOPE = "https://mail.google.com/"
 type Handler struct {
 	verbose   bool
 	Flows     map[string]*Flow
+	Tokens    map[string]*Token
 	shutdown  chan struct{}
 	server    http.Server
 	client    APIClient
@@ -34,6 +34,8 @@ type Handler struct {
 }
 
 func NewHandler() (*Handler, error) {
+
+	log.Printf("tokend v%s uid=%d gid=%d started as PID %d", Version, os.Getuid(), os.Getgid(), os.Getpid())
 
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -56,13 +58,17 @@ func NewHandler() (*Handler, error) {
 
 	h := Handler{
 		verbose:  ViperGetBool("verbose"),
-		Flows:    make(map[string]*Flow),
 		shutdown: make(chan struct{}, 1),
 		Domain:   ViperGetString("domain"),
 		client:   apiClient,
 	}
 
 	err = h.ReadFlows()
+	if err != nil {
+		return nil, Fatal(err)
+	}
+
+	err = h.ReadTokens()
 	if err != nil {
 		return nil, Fatal(err)
 	}
@@ -83,9 +89,28 @@ type Response struct {
 }
 
 type AuthenticateRequest struct {
-	Username string
-	Gmail    string
-	JWT      string
+	Local string `json:"local"`
+	Gmail string `json:"gmail"`
+}
+
+type AuthenticateResponse struct {
+	Response
+	URI string
+}
+
+type AuthorizeRequest struct {
+	State string `json:"state"`
+}
+
+type AuthorizedResponse struct {
+	Response
+	Text []string
+}
+
+type TokenResponse struct {
+	Local string
+	Gmail string
+	Token string
 }
 
 func (h *Handler) ReadFlows() error {
@@ -94,15 +119,61 @@ func (h *Handler) ReadFlows() error {
 		return Fatal(err)
 	}
 	h.Flows = flows
-	log.Printf("ReadFlowState: flow count=%d\n", len(h.Flows))
+	log.Printf("read in %d flows\n", len(h.Flows))
+	if h.verbose {
+		log.Println(FormatJSON(h.Flows))
+	}
+	return nil
+}
+
+func (h *Handler) ExpireFlows() error {
+	expired := make(map[string]*Flow)
+	for id, flow := range h.Flows {
+		if flow.IsExpired() {
+			expired[id] = flow
+		}
+	}
+	for id, flow := range expired {
+		err := DeleteFlow(flow)
+		if err != nil {
+			return Fatal(err)
+		}
+		delete(h.Flows, id)
+	}
 	return nil
 }
 
 func (h *Handler) WriteFlows() error {
+	log.Printf("writing out %d flows\n", len(h.Flows))
 	if h.verbose {
-		log.Printf("WriteFlows: flow count=%d\n", len(h.Flows))
+		log.Println(FormatJSON(h.Flows))
 	}
 	err := WriteFlowMap(h.Flows)
+	if err != nil {
+		return Fatal(err)
+	}
+	return nil
+}
+
+func (h *Handler) ReadTokens() error {
+	tokens, err := ReadTokenMap()
+	if err != nil {
+		return Fatal(err)
+	}
+	h.Tokens = tokens
+	log.Printf("read in %d tokens\n", len(h.Tokens))
+	if h.verbose {
+		LogTokens(h.Tokens)
+	}
+	return nil
+}
+
+func (h *Handler) WriteTokens() error {
+	log.Printf("writing out %d tokens\n", len(h.Tokens))
+	if h.verbose {
+		LogTokens(h.Tokens)
+	}
+	err := WriteTokenMap(h.Tokens)
 	if err != nil {
 		return Fatal(err)
 	}
@@ -143,16 +214,16 @@ func (h *Handler) succeed(w http.ResponseWriter, message string, result interfac
 }
 
 func (h *Handler) logResponse(status int, message string, result interface{}) {
-	log.Printf("<--[%d] %s\n", status, message)
-	if h.verbose {
-		log.Println(FormatJSON(result))
+	log.Printf("<--response [%d] %s\n", status, message)
+	if h.verbose && result != nil {
+		log.Printf("response body: %s\n", FormatJSON(result))
 	}
 }
 
 func (h *Handler) validateRequest(w http.ResponseWriter, r *http.Request, request interface{}) (string, map[string]string, bool) {
 	// FIXME: authenticate request
 	endpoint := r.URL.Path
-	log.Printf("%s --> %s %s %s\n", r.Host, r.Proto, r.Method, endpoint)
+	log.Printf("request--> %s %s %s %s %s\n", r.RemoteAddr, r.Header.Get("X-Real-IP"), r.Proto, r.Method, endpoint)
 	defer r.Body.Close()
 	if r.Method == http.MethodPost {
 		bodyData, err := io.ReadAll(r.Body)
@@ -165,6 +236,7 @@ func (h *Handler) validateRequest(w http.ResponseWriter, r *http.Request, reques
 				Warning("cannot unmarshall request body into: %v", request)
 				request = make(map[string]any)
 			}
+			log.Printf("raw request body: %s\n", string(bodyData))
 			err := json.Unmarshal(bodyData, request)
 			if err != nil {
 				h.failInternal(w, endpoint, Fatal(err))
@@ -184,34 +256,44 @@ func (h *Handler) validateRequest(w http.ResponseWriter, r *http.Request, reques
 	return endpoint, params, true
 }
 
+func (h *Handler) validateLocalAddress(w http.ResponseWriter, endpoint, local string) bool {
+
+	if local == "" {
+		h.fail(w, endpoint, "missing username", http.StatusBadRequest)
+		return false
+	}
+
+	if !strings.HasPrefix(local, "gmail.") {
+		h.fail(w, endpoint, fmt.Sprintf("username %s missing 'gmail.' prefix", local), http.StatusBadRequest)
+		return false
+	}
+
+	if !strings.HasSuffix(local, "@"+h.Domain) {
+		h.fail(w, endpoint, fmt.Sprintf("username %s domain mismatch", local), http.StatusBadRequest)
+		return false
+	}
+
+	_, ok := h.Usernames[local]
+	if !ok {
+		h.fail(w, endpoint, fmt.Sprintf("username %s is unknown", local), http.StatusNotFound)
+		return false
+	}
+
+	return true
+}
+
 func (h *Handler) handleAuthenticateRequest(w http.ResponseWriter, r *http.Request) {
 	var request AuthenticateRequest
 	endpoint, _, ok := h.validateRequest(w, r, &request)
 	if !ok {
 		return
 	}
-	if request.Username == "" {
-		h.fail(w, endpoint, "missing username", http.StatusBadRequest)
+
+	if !h.validateLocalAddress(w, endpoint, request.Local) {
 		return
 	}
 
-	if !strings.HasPrefix(request.Username, "gmail.") {
-		h.fail(w, endpoint, fmt.Sprintf("username %s missing 'gmail.' prefix", request.Username), http.StatusBadRequest)
-		return
-	}
-
-	if !strings.HasSuffix(request.Username, "@"+h.Domain) {
-		h.fail(w, endpoint, fmt.Sprintf("username %s domain mismatch", request.Username), http.StatusBadRequest)
-		return
-	}
-
-	_, ok = h.Usernames[request.Username]
-	if !ok {
-		h.fail(w, endpoint, fmt.Sprintf("username %s is unknown", request.Username), http.StatusNotFound)
-		return
-	}
-
-	flow, err := h.NewFlow(request.Username)
+	flow, err := h.NewFlow(request.Local)
 	if err != nil {
 		h.failInternal(w, endpoint, Fatal(err))
 		return
@@ -222,7 +304,7 @@ func (h *Handler) handleAuthenticateRequest(w http.ResponseWriter, r *http.Reque
 	params["access_type"] = "offline"
 	params["include_granted_scopes"] = "true"
 	params["response_type"] = "code"
-	params["state"] = flow.Nonce.Text
+	params["state"] = flow.Id
 	params["redirect_uri"] = ViperGetString("authenticated_redirect_uri")
 	params["client_id"] = ViperGetString("client_id")
 	params["prompt"] = "select_account consent"
@@ -234,11 +316,12 @@ func (h *Handler) handleAuthenticateRequest(w http.ResponseWriter, r *http.Reque
 	}
 
 	// respond with the OAUTH2 auth URI
-	var response Response
+	var response AuthenticateResponse
 	response.Success = true
-	response.User = request.Username
+	response.User = request.Local
 	response.Request = endpoint
-	response.Message = authURI.String()
+	response.Message = "generated authenticate URI"
+	response.URI = authURI.String()
 	h.succeed(w, response.Message, &response)
 }
 
@@ -249,63 +332,39 @@ func (h *Handler) handleDeauthenticateRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if request.Username == "" {
-		h.fail(w, endpoint, "missing username", http.StatusBadRequest)
+	if !h.validateLocalAddress(w, endpoint, request.Local) {
 		return
 	}
 
-	endpoint = fmt.Sprintf("deauthenticate %s", request.Username)
-
-	if !strings.HasPrefix(request.Username, "gmail.") {
-		h.fail(w, endpoint, "username requires 'gmail.' prefix", http.StatusBadRequest)
-		return
-	}
-
-	if !strings.HasSuffix(request.Username, "@"+h.Domain) {
-		h.fail(w, endpoint, fmt.Sprintf("domain must be %s", h.Domain), http.StatusBadRequest)
-		return
-	}
-
-	_, ok = h.Usernames[request.Username]
-	if !ok {
-		h.fail(w, endpoint, fmt.Sprintf("unknown username: %s", request.Username), http.StatusNotFound)
-		return
-	}
-
-	var deauthState string
-	var deauthFlow *Flow
-	for state, flow := range h.Flows {
-		if flow.Local == request.Username {
-			deauthState = state
-			deauthFlow = flow
-			break
+	deauthTokens := make(map[string]*Token)
+	var found bool
+	for id, token := range h.Tokens {
+		if token.LocalAddress == request.Local {
+			deauthTokens[id] = token
+			found = true
 		}
 	}
 
-	if deauthState == "" {
-		h.fail(w, endpoint, fmt.Sprintf("no authorization found for: %s", request.Username), http.StatusNotFound)
-	}
-
-	delete(h.Flows, deauthState)
-	states, err := ListFlowStates()
-	if err != nil {
-		h.failInternal(w, endpoint, Fatal(err))
+	if !found {
+		h.fail(w, endpoint, fmt.Sprintf("no token found for: %s", request.Local), http.StatusNotFound)
 		return
 	}
 
-	if slices.Contains(states, deauthState) {
-		err := DeleteFlow(deauthFlow)
+	for id, token := range deauthTokens {
+		delete(h.Tokens, id)
+		err := DeleteToken(token)
 		if err != nil {
 			h.failInternal(w, endpoint, Fatal(err))
 			return
 		}
 	}
+	h.Usernames[request.Local] = ""
 
 	var response Response
 	response.Success = true
-	response.User = request.Username
+	response.User = request.Local
 	response.Request = endpoint
-	response.Message = fmt.Sprintf("OAUTH2 gmail tokens deleted for %s;  IMPORTANT: You must also remove the 3rd-party authorizations on your Google account.", request.Username)
+	response.Message = fmt.Sprintf("removed gmail authorization for %s", request.Local)
 	h.succeed(w, response.Message, &response)
 }
 
@@ -353,7 +412,10 @@ func (h *Handler) handleAuthenticatedCallback(w http.ResponseWriter, r *http.Req
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
+
+	// store the code in the Flow for a later call from the frontend with this state
 	flow.Code = authParams["code"]
+
 	relayParams := map[string]string{}
 	relayParams["state"] = authParams["state"]
 	relayParams["authentication"] = "success"
@@ -363,19 +425,21 @@ func (h *Handler) handleAuthenticatedCallback(w http.ResponseWriter, r *http.Req
 		h.failInternal(w, endpoint, Fatal(err))
 		return
 	}
+	log.Printf("redirecting to frontend with query params: %s\n", FormatJSON(relayParams))
 	http.Redirect(w, r, redirectURI.String(), http.StatusFound)
+	// We could send a GET request to google now, but we redirect so the frontend
+	// can call us back to make the GET request and display the edited result
 }
 
 func (h *Handler) handleAuthorizeRequest(w http.ResponseWriter, r *http.Request) {
-	var request map[string]any
+	var request AuthorizeRequest
 	endpoint, _, ok := h.validateRequest(w, r, &request)
 	if !ok {
 		return
 	}
-	state := request["state"].(string)
-	flow, ok := h.Flows[state]
+	flow, ok := h.Flows[request.State]
 	if !ok {
-		fmt.Printf("%s: unknown OAUTH flow: state=%s\n", endpoint, state)
+		fmt.Printf("%s: unknown OAUTH flow: state=%s\n", endpoint, request.State)
 		h.fail(w, endpoint, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -405,22 +469,24 @@ func (h *Handler) handleAuthorizeRequest(w http.ResponseWriter, r *http.Request)
 
 	log.Printf("responseData: %s\n", FormatJSON(responseData))
 
-	token, err := NewToken(responseData)
+	token, err := NewToken(flow.LocalAddress, responseData)
 	if err != nil {
 		h.failInternal(w, endpoint, Fatal(err))
 		return
 	}
 
-	flow.Token = token
-	gmailAddress := token.JWT["email"]
-	flow.Gmail = gmailAddress
-	h.Usernames[flow.Local] = gmailAddress
+	h.Tokens[token.Id] = token
+	h.Usernames[flow.LocalAddress] = token.GmailAddress
 
-	var response Response
+	var response AuthorizedResponse
 	response.Success = true
-	response.User = flow.Local
+	response.User = flow.LocalAddress
 	response.Request = endpoint
-	response.Message = fmt.Sprintf("incoming mail to %s will be fetched to %s and outgoing mail will route via gmail", flow.Gmail, flow.Local)
+	response.Message = "authorization token received"
+	response.Text = []string{
+		fmt.Sprintf("incoming gmail to %s will be fetched into local %s inbox", token.GmailAddress, token.LocalAddress),
+		fmt.Sprintf("mail sent from local %s will be routed via gmail from %s", token.LocalAddress, token.GmailAddress),
+	}
 	h.succeed(w, response.Message, &response)
 }
 
@@ -434,34 +500,13 @@ func (h *Handler) handleAuthorizedCallback(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *Handler) NewFlow(address string) (*Flow, error) {
-	flow, err := NewFlow()
+	flow, err := NewFlow(address)
 	if err != nil {
 		return nil, Fatal(err)
 	}
-	flow.Local = address
-	h.Flows[flow.Nonce.Text] = flow
+	h.Flows[flow.Id] = flow
 	return flow, nil
 }
-
-/*
-func (h *Handler) handleNonceRequest(w http.ResponseWriter, r *http.Request) {
-	endpoint, ok := h.validateRequest(w, r, nil)
-	flow, err := h.NewFlow("")
-	if err != nil {
-		h.failInternal(w, endpoint, Fatal(err))
-		return
-	}
-	_, err = w.Write([]byte(flow.Nonce.Text))
-	if err != nil {
-		h.failInternal(w, endpoint, Fatal(err))
-		return
-	}
-	w.WriteHeader(200)
-	if h.verbose {
-		log.Printf("New Flow: %s\n", FormatJSON(flow))
-	}
-}
-*/
 
 func (h *Handler) handleUsernamesRequest(w http.ResponseWriter, r *http.Request) {
 	endpoint, _, ok := h.validateRequest(w, r, nil)
@@ -469,6 +514,75 @@ func (h *Handler) handleUsernamesRequest(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	h.succeed(w, endpoint, &h.Usernames)
+}
+
+func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
+	endpoint, _, ok := h.validateRequest(w, r, nil)
+	if !ok {
+		return
+	}
+	address := r.PathValue("address")
+
+	_, ok = h.Usernames[address]
+	if !ok {
+		domainAddress := address + "@" + h.Domain
+		_, ok = h.Usernames[domainAddress]
+		if !ok {
+			h.fail(w, endpoint, fmt.Sprintf("unknown username: %s", address), http.StatusNotFound)
+			return
+		}
+		address = domainAddress
+	}
+
+	var token *Token
+	for _, t := range h.Tokens {
+		if t.LocalAddress == address {
+			token = t
+			break
+		}
+	}
+	if token == nil {
+		h.fail(w, endpoint, fmt.Sprintf("no token found for: %s", address), http.StatusNotFound)
+		return
+	}
+
+	/*
+		if !token.IsAccessTokenExpired() {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(token.AccessToken))
+			return
+		}
+	*/
+
+	requestHeader := map[string]string{
+		"Content-Type":                     "application/json",
+		"Access-Control-Allow-Origin":      "https://webmail.mailcapsule.io",
+		"Access-Control-Allow-Methods":     "GET, POST, OPTIONS",
+		"Access-Control-Allow-Credentials": "true",
+	}
+
+	requestData := map[string]string{
+		"client_id":     ViperGetString("client_id"),
+		"client_secret": ViperGetString("client_secret"),
+		"grant_type":    "refresh_token",
+		"refresh_token": token.RefreshToken,
+	}
+
+	var responseData map[string]any
+	_, err := h.client.Post(ViperGetString("token_uri"), &requestData, &responseData, &requestHeader)
+	if err != nil {
+		h.failInternal(w, endpoint, Fatal(err))
+		return
+	}
+
+	log.Printf("refresh response: %s\n", FormatJSON(responseData))
+
+	err = token.ParseResponse(responseData)
+	if err != nil {
+		h.failInternal(w, endpoint, Fatal(err))
+	}
+
+	h.succeed(w, "access_token", &TokenResponse{Local: token.LocalAddress, Gmail: token.GmailAddress, Token: token.AccessToken})
 }
 
 func (h *Handler) Run() error {
@@ -485,8 +599,6 @@ func (h *Handler) Run() error {
 
 func (h *Handler) Start() error {
 
-	log.Printf("tokend v%s uid=%d gid=%d started as PID %d", Version, os.Getuid(), os.Getgid(), os.Getpid())
-
 	addr := ViperGetString("addr")
 	port := ViperGetInt("port")
 	h.server = http.Server{
@@ -499,8 +611,8 @@ func (h *Handler) Start() error {
 	http.HandleFunc("/oauth/authenticated/", h.handleAuthenticatedCallback)
 	http.HandleFunc("POST /oauth/authorize/", h.handleAuthorizeRequest)
 	http.HandleFunc("/oauth/authorized/", h.handleAuthorizedCallback)
-	//http.HandleFunc("GET /oauth/nonce/", h.handleNonceRequest)
 	http.HandleFunc("GET /oauth/usernames/", h.handleUsernamesRequest)
+	http.HandleFunc("GET /oauth/token/{address}/", h.handleGetToken)
 
 	go func() {
 		log.Printf("listening for HTTP requests on %s\n", h.server.Addr)
@@ -567,6 +679,11 @@ func (h *Handler) Wait() error {
 		return Fatal(err)
 	}
 
+	err = h.WriteTokens()
+	if err != nil {
+		return Fatal(err)
+	}
+
 	if h.verbose {
 		log.Println("Wait: shutdown complete")
 	}
@@ -611,19 +728,24 @@ func (h *Handler) setUsernames() error {
 		return Fatal(err)
 	}
 
-	ViperSet("usernames", defaultUsers)
+	ViperSetDefault("usernames", defaultUsers)
 	h.Usernames = make(map[string]string)
 	for _, username := range ViperGetStringSlice("usernames") {
 		address := username + "@" + h.Domain
 		h.Usernames[address] = h.authorizedGmailAddress(address)
 	}
+
+	if h.verbose {
+		log.Printf("usernames: %s\n", FormatJSON(h.Usernames))
+	}
+
 	return nil
 }
 
 func (h *Handler) authorizedGmailAddress(address string) string {
-	for _, flow := range h.Flows {
-		if flow.Local == address {
-			return flow.Gmail
+	for _, token := range h.Tokens {
+		if token.LocalAddress == address {
+			return token.GmailAddress
 		}
 	}
 	return ""
