@@ -29,7 +29,7 @@ type Handler struct {
 	server    http.Server
 	client    APIClient
 	Domain    string
-	Usernames []string
+	Usernames map[string]string
 }
 
 func NewHandler() (*Handler, error) {
@@ -43,36 +43,30 @@ func NewHandler() (*Handler, error) {
 		ViperSetDefault("domain", domain)
 	}
 
-	err = setDefaultUsernames()
-	if err != nil {
-		return nil, Fatal(err)
-	}
-
 	apiClient, err := NewAPIClient("", "", "", "", "", nil)
 	if err != nil {
 		return nil, Fatal(err)
 	}
 
 	domain = ViperGetString("domain")
-	usernames := []string{}
-
-	for _, name := range ViperGetStringSlice("usernames") {
-		usernames = append(usernames, name+"@"+domain)
-	}
 
 	ViperSetDefault("scope", DEFAULT_SCOPE)
 	ViperSetDefault("frontend_uri", fmt.Sprintf("https://webmail.%s/oauth/", domain))
 
 	h := Handler{
-		verbose:   ViperGetBool("verbose"),
-		Flows:     make(map[string]*Flow),
-		shutdown:  make(chan struct{}, 1),
-		Domain:    domain,
-		Usernames: usernames,
-		client:    apiClient,
+		verbose:  ViperGetBool("verbose"),
+		Flows:    make(map[string]*Flow),
+		shutdown: make(chan struct{}, 1),
+		Domain:   ViperGetString("domain"),
+		client:   apiClient,
 	}
 
-	err = h.ReadFlowState()
+	err = h.ReadFlows()
+	if err != nil {
+		return nil, Fatal(err)
+	}
+
+	err = h.setUsernames()
 	if err != nil {
 		return nil, Fatal(err)
 	}
@@ -93,7 +87,7 @@ type AuthenticateRequest struct {
 	JWT      string
 }
 
-func (h *Handler) ReadFlowState() error {
+func (h *Handler) ReadFlows() error {
 	flows, err := ReadFlowMap()
 	if err != nil {
 		return Fatal(err)
@@ -103,9 +97,9 @@ func (h *Handler) ReadFlowState() error {
 	return nil
 }
 
-func (h *Handler) WriteFlowState() error {
+func (h *Handler) WriteFlows() error {
 	if h.verbose {
-		log.Printf("WriteFlowState: flow count=%d\n", len(h.Flows))
+		log.Printf("WriteFlows: flow count=%d\n", len(h.Flows))
 	}
 	err := WriteFlowMap(h.Flows)
 	if err != nil {
@@ -191,18 +185,18 @@ func (h *Handler) handleAuthenticateRequest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if !slices.Contains(h.Usernames, request.Username) {
+	_, ok := h.Usernames[request.Username]
+	if !ok {
 		h.fail(w, request.Username, requestString, fmt.Sprintf("unknown username: %s", request.Username), http.StatusNotFound)
 		return
 	}
 
-	flow, err := h.NewFlow()
+	flow, err := h.NewFlow(request.Username)
 	if err != nil {
 		log.Printf("%v\n", Fatal(err))
 		h.fail(w, "TOKEN_DAEMON", "authenticate_request", "server failure", http.StatusInternalServerError)
 		return
 	}
-	flow.Local = request.Username
 
 	params := map[string]string{}
 	params["scope"] = ViperGetString("scope")
@@ -260,7 +254,8 @@ func (h *Handler) handleDeauthenticateRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if !slices.Contains(h.Usernames, request.Username) {
+	_, ok := h.Usernames[request.Username]
+	if !ok {
 		h.fail(w, request.Username, requestString, fmt.Sprintf("unknown username: %s", request.Username), http.StatusNotFound)
 		return
 	}
@@ -399,15 +394,13 @@ func (h *Handler) handleAuthorizeRequest(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	/*
-		form := url.Values{}
-		form.Add("client_id", ViperGetString("client_id"))
-		form.Add("client_secret", ViperGetString("client_secret"))
-		form.Add("code", flow.Code)
-		form.Add("grant_type", "authorization_code")
-		form.Add("redirect_uri", ViperGetString("authorized_redirect_uri"))
-		requestData := []byte(form.Encode())
-	*/
+	requestHeader := map[string]string{
+		"Content-Type":                     "application/json",
+		"Access-Control-Allow-Origin":      "https://webmail.mailcapsule.io",
+		"Access-Control-Allow-Methods":     "GET, POST, OPTIONS",
+		"Access-Control-Allow-Credentials": "true",
+	}
+
 	requestData := map[string]string{
 		"client_id":     ViperGetString("client_id"),
 		"client_secret": ViperGetString("client_secret"),
@@ -416,24 +409,17 @@ func (h *Handler) handleAuthorizeRequest(w http.ResponseWriter, r *http.Request)
 		"redirect_uri":  ViperGetString("authenticated_redirect_uri"),
 	}
 
-	header := map[string]string{
-		"Content-Type":                     "application/json",
-		"Access-Control-Allow-Origin":      "https://webmail.mailcapsule.io",
-		"Access-Control-Allow-Methods":     "GET, POST, OPTIONS",
-		"Access-Control-Allow-Credentials": "true",
-	}
-
-	var accessData map[string]any
-	_, err = h.client.Post(ViperGetString("token_uri"), &requestData, &accessData, &header)
+	var responseData map[string]any
+	_, err = h.client.Post(ViperGetString("token_uri"), &requestData, &responseData, &requestHeader)
 	if err != nil {
 		log.Printf("%s failed posting access request: %v", requestString, Fatal(err))
 		h.fail(w, "TOKEN_DAEMON", requestString, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("accessData: %s\n", FormatJSON(accessData))
+	log.Printf("responseData: %s\n", FormatJSON(responseData))
 
-	token, err := NewToken(accessData)
+	token, err := NewToken(responseData)
 	if err != nil {
 		log.Printf("%s failed parsing access token data: %v", requestString, Fatal(err))
 		h.fail(w, "TOKEN_DAEMON", requestString, "internal error", http.StatusInternalServerError)
@@ -441,13 +427,15 @@ func (h *Handler) handleAuthorizeRequest(w http.ResponseWriter, r *http.Request)
 	}
 
 	flow.Token = token
-	flow.Gmail = token.JWT["email"]
+	gmailAddress := token.JWT["email"]
+	flow.Gmail = gmailAddress
+	h.Usernames[flow.Local] = gmailAddress
 
 	var response Response
 	response.Success = true
 	response.User = flow.Local
 	response.Request = requestString
-	response.Message = fmt.Sprintf("incoming mail to %s will be fetched to %s, sent mail will route via gmail", flow.Gmail, flow.Local)
+	response.Message = fmt.Sprintf("incoming mail to %s will be fetched to %s and outgoing mail will route via gmail", flow.Gmail, flow.Local)
 	h.succeed(w, response.Message, &response)
 }
 
@@ -471,11 +459,12 @@ func (h *Handler) handleAuthorizedCallback(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-func (h *Handler) NewFlow() (*Flow, error) {
+func (h *Handler) NewFlow(address string) (*Flow, error) {
 	flow, err := NewFlow()
 	if err != nil {
 		return nil, Fatal(err)
 	}
+	flow.Local = address
 	h.Flows[flow.Nonce.Text] = flow
 	return flow, nil
 }
@@ -484,7 +473,7 @@ func (h *Handler) handleNonceRequest(w http.ResponseWriter, r *http.Request) {
 	//FIXME: authenticate request
 	log.Printf("get nonce: %+v\n", *r)
 	defer r.Body.Close()
-	flow, err := h.NewFlow()
+	flow, err := h.NewFlow("")
 	if err != nil {
 		log.Printf("%v\n", Fatal(err))
 		h.fail(w, "TOKEN_DAEMON", "get nonce", "internal failure", http.StatusInternalServerError)
@@ -598,7 +587,7 @@ func (h *Handler) Wait() error {
 		return Fatal(err)
 	}
 
-	err = h.WriteFlowState()
+	err = h.WriteFlows()
 	if err != nil {
 		return Fatal(err)
 	}
@@ -624,20 +613,21 @@ func (h *Handler) Stop() error {
 	return nil
 }
 
-func setDefaultUsernames() error {
+func (h *Handler) setUsernames() error {
 	ifp, err := os.Open("/etc/passwd")
 	if err != nil {
 		return Fatal(err)
 	}
 	defer ifp.Close()
-	usernames := []string{}
+
+	defaultUsers := []string{}
 	scanner := bufio.NewScanner(ifp)
 	for scanner.Scan() {
 		text := scanner.Text()
 		if strings.HasPrefix(text, "gmail.") {
 			user, _, ok := strings.Cut(text, ":")
 			if ok {
-				usernames = append(usernames, user)
+				defaultUsers = append(defaultUsers, user)
 			}
 		}
 	}
@@ -645,6 +635,21 @@ func setDefaultUsernames() error {
 	if err != nil {
 		return Fatal(err)
 	}
-	ViperSetDefault("usernames", usernames)
+
+	ViperSet("usernames", defaultUsers)
+	h.Usernames = make(map[string]string)
+	for _, username := range ViperGetStringSlice("usernames") {
+		address := username + "@" + h.Domain
+		h.Usernames[address] = h.authorizedGmailAddress(address)
+	}
 	return nil
+}
+
+func (h *Handler) authorizedGmailAddress(address string) string {
+	for _, flow := range h.Flows {
+		if flow.Local == address {
+			return flow.Gmail
+		}
+	}
+	return ""
 }
