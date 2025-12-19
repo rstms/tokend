@@ -40,7 +40,7 @@ import (
 var cfgFile string
 
 var rootCmd = &cobra.Command{
-	Version: "0.0.8",
+	Version: "0.0.9",
 	Use:     "tokend",
 	Short:   "OAUTH2 backend and token mananagement daemon",
 	Long: `
