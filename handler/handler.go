@@ -20,17 +20,17 @@ import (
 const Version = "0.0.1"
 
 const SHUTDOWN_TIMEOUT = 5 * time.Second
-const DEFAULT_SCOPE = "https://mail.google.com/"
 
 type Handler struct {
 	verbose   bool
 	Flows     map[string]*Flow
 	Tokens    map[string]*Token
+	Usernames map[string]string
 	shutdown  chan struct{}
 	server    http.Server
 	client    APIClient
+	apiKey    string
 	Domain    string
-	Usernames map[string]string
 }
 
 func NewHandler() (*Handler, error) {
@@ -45,22 +45,33 @@ func NewHandler() (*Handler, error) {
 	if ok {
 		ViperSetDefault("domain", domain)
 	}
+	domain = ViperGetString("domain")
+
+	ViperSetDefault("scopes", []string{"https://mail.google.com/"})
+	ViperSetDefault("frontend_uri", fmt.Sprintf("https://webmail.%s/oauth/", domain))
+	ViperSetDefault("auth_uri", "https://accounts.google.com/o/oauth2/auth")
+	ViperSetDefault("token_uri", "https://oauth2.googleapis.com/token")
+	ViperSetDefault("authenticated_redirect_uri", fmt.Sprintf("https://webmail.%s/oauth/authenticated/", domain))
+	ViperSetDefault("authorized_redirect_uri", fmt.Sprintf("https://webmail.%s/oauth/authorized/", domain))
+	ViperSetDefault("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs")
 
 	apiClient, err := NewAPIClient("", "", "", "", "", nil)
 	if err != nil {
 		return nil, Fatal(err)
 	}
 
-	domain = ViperGetString("domain")
-
-	ViperSetDefault("scope", DEFAULT_SCOPE)
-	ViperSetDefault("frontend_uri", fmt.Sprintf("https://webmail.%s/oauth/", domain))
+	for _, key := range []string{"client_id", "client_secret", "api_key"} {
+		if ViperGetString(key) == "" {
+			return nil, Fatalf("missing config value: '%s'", key)
+		}
+	}
 
 	h := Handler{
 		verbose:  ViperGetBool("verbose"),
 		shutdown: make(chan struct{}, 1),
-		Domain:   ViperGetString("domain"),
+		Domain:   domain,
 		client:   apiClient,
+		apiKey:   ViperGetString("api_key"),
 	}
 
 	err = h.ReadFlows()
@@ -221,7 +232,7 @@ func (h *Handler) logResponse(status int, message string, result interface{}) {
 }
 
 func (h *Handler) validateRequest(w http.ResponseWriter, r *http.Request, request interface{}) (string, map[string]string, bool) {
-	// FIXME: authenticate request
+	// FIXME: require request remote IP address present in iplsd client whitelist
 	endpoint := r.URL.Path
 	log.Printf("request--> %s %s %s %s %s\n", r.RemoteAddr, r.Header.Get("X-Real-IP"), r.Proto, r.Method, endpoint)
 	defer r.Body.Close()
@@ -300,7 +311,7 @@ func (h *Handler) handleAuthenticateRequest(w http.ResponseWriter, r *http.Reque
 	}
 
 	params := map[string]string{}
-	params["scope"] = ViperGetString("scope")
+	params["scopes"] = strings.Join(ViperGetStringSlice("scopes"), " ")
 	params["access_type"] = "offline"
 	params["include_granted_scopes"] = "true"
 	params["response_type"] = "code"
@@ -467,7 +478,7 @@ func (h *Handler) handleAuthorizeRequest(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	log.Printf("responseData: %s\n", FormatJSON(responseData))
+	//log.Printf("responseData: %s\n", FormatJSON(responseData))
 
 	token, err := NewToken(flow.LocalAddress, responseData)
 	if err != nil {
@@ -517,6 +528,8 @@ func (h *Handler) handleUsernamesRequest(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
+	// FIXME: require X-Api-Key header
+	// FIXME: require valid client certificate
 	endpoint, _, ok := h.validateRequest(w, r, nil)
 	if !ok {
 		return
@@ -546,40 +559,43 @@ func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	/*
-		if !token.IsAccessTokenExpired() {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(token.AccessToken))
+	if token.IsAccessTokenExpired() {
+
+		requestHeader := map[string]string{
+			"Content-Type":                     "application/json",
+			"Access-Control-Allow-Origin":      "https://webmail.mailcapsule.io",
+			"Access-Control-Allow-Methods":     "GET, POST, OPTIONS",
+			"Access-Control-Allow-Credentials": "true",
+		}
+
+		requestData := map[string]string{
+			"client_id":     ViperGetString("client_id"),
+			"client_secret": ViperGetString("client_secret"),
+			"grant_type":    "refresh_token",
+			"refresh_token": token.RefreshToken,
+		}
+
+		var responseData map[string]any
+		_, err := h.client.Post(ViperGetString("token_uri"), &requestData, &responseData, &requestHeader)
+		if err != nil {
+			h.failInternal(w, endpoint, Fatal(err))
 			return
 		}
-	*/
 
-	requestHeader := map[string]string{
-		"Content-Type":                     "application/json",
-		"Access-Control-Allow-Origin":      "https://webmail.mailcapsule.io",
-		"Access-Control-Allow-Methods":     "GET, POST, OPTIONS",
-		"Access-Control-Allow-Credentials": "true",
-	}
+		//log.Printf("refresh response: %s\n", FormatJSON(responseData))
 
-	requestData := map[string]string{
-		"client_id":     ViperGetString("client_id"),
-		"client_secret": ViperGetString("client_secret"),
-		"grant_type":    "refresh_token",
-		"refresh_token": token.RefreshToken,
-	}
+		err = token.ParseResponse(responseData)
+		if err != nil {
+			h.failInternal(w, endpoint, Fatal(err))
+			return
+		}
 
-	var responseData map[string]any
-	_, err := h.client.Post(ViperGetString("token_uri"), &requestData, &responseData, &requestHeader)
-	if err != nil {
-		h.failInternal(w, endpoint, Fatal(err))
-		return
-	}
+		err = WriteToken(token)
+		if err != nil {
+			h.failInternal(w, endpoint, Fatal(err))
+			return
+		}
 
-	log.Printf("refresh response: %s\n", FormatJSON(responseData))
-
-	err = token.ParseResponse(responseData)
-	if err != nil {
-		h.failInternal(w, endpoint, Fatal(err))
 	}
 
 	h.succeed(w, "access_token", &TokenResponse{Local: token.LocalAddress, Gmail: token.GmailAddress, Token: token.AccessToken})
