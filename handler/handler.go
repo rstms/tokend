@@ -236,6 +236,9 @@ func (h *Handler) validateRequest(w http.ResponseWriter, r *http.Request, reques
 	endpoint := r.URL.Path
 	log.Printf("request--> %s %s %s %s %s\n", r.RemoteAddr, r.Header.Get("X-Real-IP"), r.Proto, r.Method, endpoint)
 	defer r.Body.Close()
+	if h.verbose {
+		log.Printf("Header: %s\n", FormatJSON(r.Header))
+	}
 	if r.Method == http.MethodPost {
 		bodyData, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -261,7 +264,7 @@ func (h *Handler) validateRequest(w http.ResponseWriter, r *http.Request, reques
 		}
 	}
 	params := parseQueryParams(r.URL)
-	if h.verbose {
+	if h.verbose && len(params) > 0 {
 		log.Printf("queryParams: %s\n", FormatJSON(params))
 	}
 	return endpoint, params, true
@@ -622,6 +625,7 @@ func (h *Handler) Start() error {
 
 	addr := ViperGetString("addr")
 	port := ViperGetInt("port")
+
 	h.server = http.Server{
 		Addr:        fmt.Sprintf("%s:%d", addr, port),
 		IdleTimeout: 5 * time.Second,
