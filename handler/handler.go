@@ -528,12 +528,17 @@ func (h *Handler) handleUsernamesRequest(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
-	// FIXME: require X-Api-Key header
-	// FIXME: require valid client certificate
 	endpoint, _, ok := h.validateRequest(w, r, nil)
 	if !ok {
 		return
 	}
+	if !h.checkClientCert(w, r, endpoint) {
+		return
+	}
+	if !h.checkApiKey(w, r, endpoint) {
+		return
+	}
+
 	address := r.PathValue("address")
 
 	_, ok = h.Usernames[address]
@@ -765,4 +770,32 @@ func (h *Handler) authorizedGmailAddress(address string) string {
 		}
 	}
 	return ""
+}
+
+func (h *Handler) checkClientCert(w http.ResponseWriter, r *http.Request, endpoint string) bool {
+	clientCertHeader, ok := r.Header["X-Client-Cert-Dn"]
+	if !ok {
+		h.failInternal(w, endpoint, Fatalf("missing client certificate"))
+		return false
+	}
+	if h.verbose {
+		log.Printf("client cert DN=%s\n", clientCertHeader[0])
+	}
+	return true
+}
+
+func (h *Handler) checkApiKey(w http.ResponseWriter, r *http.Request, endpoint string) bool {
+	apiKeyHeader, ok := r.Header["X-Api-Key"]
+	if !ok {
+		h.failInternal(w, endpoint, Fatalf("missing API key"))
+		return false
+	}
+	if apiKeyHeader[0] == h.apiKey {
+		if h.verbose {
+			log.Println("client provided matching API key")
+		}
+		return true
+	}
+	h.fail(w, endpoint, "API key mismatch", http.StatusBadRequest)
+	return false
 }
