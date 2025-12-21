@@ -311,13 +311,13 @@ func (h *Handler) handleAuthenticateRequest(w http.ResponseWriter, r *http.Reque
 	}
 
 	params := map[string]string{}
-	params["scopes"] = strings.Join(ViperGetStringSlice("scopes"), " ")
-	params["access_type"] = "offline"
-	params["include_granted_scopes"] = "true"
-	params["response_type"] = "code"
-	params["state"] = flow.Id
-	params["redirect_uri"] = ViperGetString("authenticated_redirect_uri")
 	params["client_id"] = ViperGetString("client_id")
+	params["redirect_uri"] = ViperGetString("authenticated_redirect_uri")
+	params["response_type"] = "code"
+	params["scope"] = strings.Join(ViperGetStringSlice("scopes"), " ")
+	params["access_type"] = "offline"
+	params["state"] = flow.Id
+	params["include_granted_scopes"] = "true"
 	params["prompt"] = "select_account consent"
 
 	authURI, err := h.buildURI(ViperGetString("auth_uri"), params)
