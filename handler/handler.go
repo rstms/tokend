@@ -481,7 +481,7 @@ func (h *Handler) handleAuthorizeRequest(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	//log.Printf("responseData: %s\n", FormatJSON(responseData))
+	log.Printf("responseData: %s\n", FormatJSON(responseData))
 
 	token, err := NewToken(flow.LocalAddress, responseData)
 	if err != nil {
@@ -590,7 +590,7 @@ func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		//log.Printf("refresh response: %s\n", FormatJSON(responseData))
+		log.Printf("refresh response: %s\n", FormatJSON(responseData))
 
 		err = token.ParseResponse(responseData)
 		if err != nil {
