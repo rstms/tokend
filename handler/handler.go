@@ -544,8 +544,11 @@ func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
 
 	address := r.PathValue("address")
 
+	log.Printf("GetToken: address=%s\n", address)
+
 	var localAddress string
 	for local, gmail := range h.Usernames {
+		//log.Printf("checking local=%s gmail=%s\n", local, gmail)
 		switch {
 		case local == address:
 			localAddress = local
@@ -557,6 +560,7 @@ func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
 			localAddress = local
 		}
 		if localAddress != "" {
+			log.Printf("found local=%s gmail=%s\n", localAddress, gmail)
 			break
 		}
 	}
@@ -571,7 +575,7 @@ func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
 
 	var token *Token
 	for _, t := range h.Tokens {
-		if t.LocalAddress == address {
+		if t.LocalAddress == localAddress {
 			token = t
 			break
 		}
