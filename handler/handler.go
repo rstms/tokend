@@ -544,15 +544,29 @@ func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
 
 	address := r.PathValue("address")
 
-	_, ok = h.Usernames[address]
+	var localAddress string
+	for local, gmail := range h.Usernames {
+		switch {
+		case local == address:
+			localAddress = local
+		case local == address+"@"+h.Domain:
+			localAddress = local
+		case gmail == address:
+			localAddress = local
+		case gmail == address+"@"+"gmail.com":
+			localAddress = local
+		}
+		if localAddress != "" {
+			break
+		}
+	}
+
+	_, ok = h.Usernames[localAddress]
 	if !ok {
-		domainAddress := address + "@" + h.Domain
-		_, ok = h.Usernames[domainAddress]
 		if !ok {
 			h.fail(w, endpoint, fmt.Sprintf("unknown username: %s", address), http.StatusNotFound)
 			return
 		}
-		address = domainAddress
 	}
 
 	var token *Token
