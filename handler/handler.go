@@ -119,6 +119,7 @@ type AuthorizedResponse struct {
 }
 
 type TokenResponse struct {
+	Response
 	Local string
 	Gmail string
 	Token string
@@ -624,7 +625,15 @@ func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	h.succeed(w, "access_token", &TokenResponse{Local: token.LocalAddress, Gmail: token.GmailAddress, Token: token.AccessToken})
+	var response TokenResponse
+	response.Success = true
+	response.User = "TOKEN_DAEMON"
+	response.Message = fmt.Sprintf("token for %s", address)
+	response.Request = endpoint
+	response.Local = token.LocalAddress
+	response.Gmail = token.GmailAddress
+	response.Token = token.AccessToken
+	h.succeed(w, response.Message, &response)
 }
 
 func (h *Handler) Run() error {
