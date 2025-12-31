@@ -37,7 +37,7 @@ func TestDecodeJWT(t *testing.T) {
 func TestDecodeToken(t *testing.T) {
 	data := initTokenData(t)
 	if len(data) > 0 {
-		token, err := NewToken(data)
+		token, err := NewToken("user@domain.ext", data)
 		require.Nil(t, err)
 		log.Printf("token: %s\n", FormatJSON(token))
 	}

@@ -602,8 +602,15 @@ func (h *Handler) handleGetToken(w http.ResponseWriter, r *http.Request) {
 			"refresh_token": token.RefreshToken,
 		}
 
+		uri := ViperGetString("token_uri")
+		log.Printf("access token is expired; requesting refresh...")
+		if h.verbose {
+			log.Printf("uri: %s\n", uri)
+			log.Printf("request: %s\n", FormatJSON(requestData))
+		}
+
 		var responseData map[string]any
-		_, err := h.client.Post(ViperGetString("token_uri"), &requestData, &responseData, &requestHeader)
+		_, err := h.client.Post(uri, &requestData, &responseData, &requestHeader)
 		if err != nil {
 			h.failInternal(w, endpoint, Fatal(err))
 			return
